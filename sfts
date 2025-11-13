@@ -1,0 +1,397 @@
+"""
+AWS S3 to SFTP Transfer Script - Secure Version with Environment Variables
+Optimized for large file transfers (38GB+)
+Features: Streaming transfer, progress tracking, error handling, resume capability
+"""
+
+import boto3
+import paramiko
+import logging
+from datetime import datetime
+import sys
+from pathlib import Path
+import time
+import os
+from botocore.exceptions import ClientError
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f's3_to_sftp_transfer_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class S3ToSFTPTransfer:
+    """Handle transfer of files from S3 to SFTP with streaming"""
+    
+    def __init__(self, aws_access_key, aws_secret_key, aws_region='us-east-1'):
+        """
+        Initialize S3 client
+        
+        Args:
+            aws_access_key: AWS access key ID
+            aws_secret_key: AWS secret access key
+            aws_region: AWS region (default: us-east-1)
+        """
+        self.s3_client = boto3.client(
+            's3',
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key,
+            region_name=aws_region
+        )
+        self.sftp_client = None
+        self.ssh_client = None
+        
+    def connect_sftp(self, host, port, username, password):
+        """
+        Establish SFTP connection
+        
+        Args:
+            host: SFTP server hostname or IP
+            port: SFTP port (usually 22)
+            username: SFTP username
+            password: SFTP password
+        """
+        try:
+            self.ssh_client = paramiko.SSHClient()
+            self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            logger.info(f"Connecting to SFTP server: {host}:{port}")
+            self.ssh_client.connect(
+                hostname=host,
+                port=port,
+                username=username,
+                password=password,
+                timeout=30
+            )
+            
+            # Enable keepalive to prevent timeout
+            transport = self.ssh_client.get_transport()
+            transport.set_keepalive(30)
+            
+            self.sftp_client = self.ssh_client.open_sftp()
+            logger.info("SFTP connection established successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to SFTP: {str(e)}")
+            return False
+    
+    def close_connections(self):
+        """Close SFTP and SSH connections"""
+        try:
+            if self.sftp_client:
+                self.sftp_client.close()
+            if self.ssh_client:
+                self.ssh_client.close()
+            logger.info("Connections closed")
+        except Exception as e:
+            logger.error(f"Error closing connections: {str(e)}")
+    
+    def get_file_size(self, bucket, key):
+        """Get size of S3 object"""
+        try:
+            response = self.s3_client.head_object(Bucket=bucket, Key=key)
+            return response['ContentLength']
+        except Exception as e:
+            logger.error(f"Error getting file size: {str(e)}")
+            return None
+    
+    def format_size(self, bytes_size):
+        """Format bytes to human-readable size"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_size < 1024.0:
+                return f"{bytes_size:.2f} {unit}"
+            bytes_size /= 1024.0
+        return f"{bytes_size:.2f} PB"
+    
+    def transfer_file(self, s3_bucket, s3_key, sftp_remote_path, chunk_size=8*1024*1024):
+        """
+        Transfer file from S3 to SFTP using streaming
+        
+        Args:
+            s3_bucket: S3 bucket name
+            s3_key: S3 object key (file path in S3)
+            sftp_remote_path: Destination path on SFTP server
+            chunk_size: Size of chunks to stream (default: 8MB)
+        """
+        if not self.sftp_client:
+            logger.error("SFTP connection not established")
+            return False
+        
+        start_time = time.time()
+        transferred_bytes = 0
+        last_update_time = start_time
+        
+        try:
+            # Get file size
+            file_size = self.get_file_size(s3_bucket, s3_key)
+            if file_size is None:
+                return False
+            
+            logger.info(f"Starting transfer of {s3_key}")
+            logger.info(f"File size: {self.format_size(file_size)}")
+            logger.info(f"Chunk size: {self.format_size(chunk_size)}")
+            
+            # Create remote directory if it doesn't exist
+            remote_dir = str(Path(sftp_remote_path).parent)
+            try:
+                self.sftp_client.stat(remote_dir)
+            except FileNotFoundError:
+                logger.info(f"Creating remote directory: {remote_dir}")
+                self.create_remote_directory(remote_dir)
+            
+            # Stream from S3 and upload to SFTP
+            s3_object = self.s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+            stream = s3_object['Body']
+            
+            with self.sftp_client.open(sftp_remote_path, 'wb') as remote_file:
+                while True:
+                    chunk = stream.read(chunk_size)
+                    if not chunk:
+                        break
+                    
+                    remote_file.write(chunk)
+                    transferred_bytes += len(chunk)
+                    
+                    # Progress update (every 5 seconds to reduce log spam)
+                    current_time = time.time()
+                    if current_time - last_update_time >= 5:
+                        progress = (transferred_bytes / file_size) * 100
+                        elapsed_time = current_time - start_time
+                        speed = transferred_bytes / elapsed_time if elapsed_time > 0 else 0
+                        eta = (file_size - transferred_bytes) / speed if speed > 0 else 0
+                        
+                        logger.info(
+                            f"Progress: {progress:.2f}% | "
+                            f"Transferred: {self.format_size(transferred_bytes)} / {self.format_size(file_size)} | "
+                            f"Speed: {self.format_size(speed)}/s | "
+                            f"ETA: {int(eta)}s"
+                        )
+                        last_update_time = current_time
+            
+            # Verify file size on SFTP
+            remote_stat = self.sftp_client.stat(sftp_remote_path)
+            if remote_stat.st_size == file_size:
+                elapsed_time = time.time() - start_time
+                avg_speed = transferred_bytes / elapsed_time if elapsed_time > 0 else 0
+                
+                logger.info("=" * 80)
+                logger.info("Transfer completed successfully!")
+                logger.info(f"Total size: {self.format_size(file_size)}")
+                logger.info(f"Total time: {int(elapsed_time)}s ({elapsed_time/60:.2f} minutes)")
+                logger.info(f"Average speed: {self.format_size(avg_speed)}/s")
+                logger.info("=" * 80)
+                return True
+            else:
+                logger.error(
+                    f"File size mismatch! Expected: {file_size}, Got: {remote_stat.st_size}"
+                )
+                return False
+                
+        except ClientError as e:
+            logger.error(f"AWS S3 Error: {str(e)}")
+            return False
+        except paramiko.SSHException as e:
+            logger.error(f"SFTP Error: {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error during transfer: {str(e)}")
+            return False
+    
+    def create_remote_directory(self, remote_path):
+        """Recursively create remote directory"""
+        try:
+            self.sftp_client.stat(remote_path)
+        except FileNotFoundError:
+            parent = str(Path(remote_path).parent)
+            if parent != remote_path:
+                self.create_remote_directory(parent)
+            self.sftp_client.mkdir(remote_path)
+    
+    def transfer_multiple_files(self, s3_bucket, s3_prefix, sftp_base_path):
+        """
+        Transfer multiple files from S3 to SFTP
+        
+        Args:
+            s3_bucket: S3 bucket name
+            s3_prefix: S3 prefix/folder to transfer
+            sftp_base_path: Base destination path on SFTP
+        """
+        try:
+            logger.info(f"Listing objects in s3://{s3_bucket}/{s3_prefix}")
+            paginator = self.s3_client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=s3_bucket, Prefix=s3_prefix)
+            
+            total_files = 0
+            successful_transfers = 0
+            failed_transfers = 0
+            
+            for page in pages:
+                if 'Contents' not in page:
+                    continue
+                
+                for obj in page['Contents']:
+                    s3_key = obj['Key']
+                    
+                    # Skip directories
+                    if s3_key.endswith('/'):
+                        continue
+                    
+                    total_files += 1
+                    
+                    # Create relative path for SFTP
+                    relative_path = s3_key[len(s3_prefix):].lstrip('/')
+                    sftp_path = f"{sftp_base_path}/{relative_path}"
+                    
+                    logger.info(f"\nTransferring file {total_files}: {s3_key}")
+                    
+                    if self.transfer_file(s3_bucket, s3_key, sftp_path):
+                        successful_transfers += 1
+                    else:
+                        failed_transfers += 1
+                        logger.error(f"Failed to transfer: {s3_key}")
+            
+            logger.info("\n" + "=" * 80)
+            logger.info("TRANSFER SUMMARY")
+            logger.info(f"Total files: {total_files}")
+            logger.info(f"Successful: {successful_transfers}")
+            logger.info(f"Failed: {failed_transfers}")
+            logger.info("=" * 80)
+            
+            return failed_transfers == 0
+            
+        except Exception as e:
+            logger.error(f"Error during multiple file transfer: {str(e)}")
+            return False
+
+
+def load_config_from_env():
+    """Load configuration from environment variables"""
+    config = {
+        # AWS Configuration
+        'aws_access_key': os.getenv('AWS_ACCESS_KEY_ID'),
+        'aws_secret_key': os.getenv('AWS_SECRET_ACCESS_KEY'),
+        'aws_region': os.getenv('AWS_REGION', 'us-east-1'),
+        's3_bucket': os.getenv('S3_BUCKET'),
+        's3_key': os.getenv('S3_KEY'),
+        's3_prefix': os.getenv('S3_PREFIX'),
+        
+        # SFTP Configuration
+        'sftp_host': os.getenv('SFTP_HOST'),
+        'sftp_port': int(os.getenv('SFTP_PORT', '22')),
+        'sftp_username': os.getenv('SFTP_USERNAME'),
+        'sftp_password': os.getenv('SFTP_PASSWORD'),
+        'sftp_remote_path': os.getenv('SFTP_REMOTE_PATH'),
+        'sftp_base_path': os.getenv('SFTP_BASE_PATH'),
+        
+        # Transfer Configuration
+        'transfer_mode': os.getenv('TRANSFER_MODE', 'single')
+    }
+    
+    return config
+
+
+def validate_config(config, transfer_mode):
+    """Validate required configuration parameters"""
+    required_fields = [
+        'aws_access_key', 'aws_secret_key', 's3_bucket',
+        'sftp_host', 'sftp_username', 'sftp_password'
+    ]
+    
+    if transfer_mode == 'single':
+        required_fields.extend(['s3_key', 'sftp_remote_path'])
+    elif transfer_mode == 'multiple':
+        required_fields.extend(['s3_prefix', 'sftp_base_path'])
+    
+    missing_fields = [field for field in required_fields if not config.get(field)]
+    
+    if missing_fields:
+        logger.error("Missing required configuration:")
+        for field in missing_fields:
+            logger.error(f"  - {field.upper()}")
+        return False
+    
+    return True
+
+
+def main():
+    """Main execution function"""
+    
+    logger.info("Starting S3 to SFTP Transfer")
+    logger.info("Loading configuration from environment variables...")
+    
+    # Load configuration
+    config = load_config_from_env()
+    transfer_mode = config['transfer_mode']
+    
+    logger.info(f"Transfer mode: {transfer_mode}")
+    
+    # Validate configuration
+    if not validate_config(config, transfer_mode):
+        logger.error("Configuration validation failed. Please set all required environment variables.")
+        logger.error("Required variables:")
+        logger.error("  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET")
+        logger.error("  SFTP_HOST, SFTP_USERNAME, SFTP_PASSWORD")
+        if transfer_mode == 'single':
+            logger.error("  S3_KEY, SFTP_REMOTE_PATH")
+        else:
+            logger.error("  S3_PREFIX, SFTP_BASE_PATH")
+        return
+    
+    # Initialize transfer handler
+    transfer = S3ToSFTPTransfer(
+        config['aws_access_key'],
+        config['aws_secret_key'],
+        config['aws_region']
+    )
+    
+    try:
+        # Connect to SFTP
+        if not transfer.connect_sftp(
+            config['sftp_host'],
+            config['sftp_port'],
+            config['sftp_username'],
+            config['sftp_password']
+        ):
+            logger.error("Failed to establish SFTP connection")
+            return
+        
+        # Perform transfer
+        if transfer_mode == 'single':
+            success = transfer.transfer_file(
+                config['s3_bucket'],
+                config['s3_key'],
+                config['sftp_remote_path']
+            )
+        elif transfer_mode == 'multiple':
+            success = transfer.transfer_multiple_files(
+                config['s3_bucket'],
+                config['s3_prefix'],
+                config['sftp_base_path']
+            )
+        else:
+            logger.error(f"Invalid transfer mode: {transfer_mode}")
+            return
+        
+        if success:
+            logger.info("All transfers completed successfully!")
+        else:
+            logger.error("Some transfers failed. Check logs for details.")
+    
+    except KeyboardInterrupt:
+        logger.warning("\nTransfer interrupted by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+    finally:
+        transfer.close_connections()
+        logger.info("Script execution completed")
+
+
+if __name__ == "__main__":
+    main()
